@@ -67,9 +67,12 @@ impl<K, V, const N: usize> Map<K, V, N> {
 
 impl<K, V, const N: usize> Drop for Map<K, V, N> {
     fn drop(&mut self) {
-        for i in 0..self.len {
-            unsafe { self.item_drop(i) };
-        }
+        let initialized =
+            core::ptr::slice_from_raw_parts_mut(self.pairs.as_mut_ptr().cast::<(K, V)>(), self.len);
+        // SAFETY: exactly the prefix `0..len` contains initialized pairs,
+        // and slice drop glue keeps destroying the remaining entries even
+        // when one of the `Drop` impls panics.
+        unsafe { core::ptr::drop_in_place(initialized) };
     }
 }
 
@@ -120,5 +123,48 @@ mod tests {
         m.insert((), Rc::clone(&v));
         drop(m);
         assert_eq!(Rc::strong_count(&v), 1);
+    }
+
+    #[test]
+    fn drops_all_entries_when_a_drop_panics() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        struct Bomb {
+            drops: Arc<AtomicUsize>,
+            armed: bool,
+        }
+        impl Drop for Bomb {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+                assert!(!self.armed, "Bomb exploded");
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut m: Map<u8, Bomb, 2> = Map::new();
+        m.insert(
+            0,
+            Bomb {
+                drops: Arc::clone(&drops),
+                armed: true,
+            },
+        );
+        m.insert(
+            1,
+            Bomb {
+                drops: Arc::clone(&drops),
+                armed: false,
+            },
+        );
+        let caught = catch_unwind(AssertUnwindSafe(|| drop(m)));
+        assert!(
+            caught.is_err(),
+            "drop() must propagate the panic of the armed Drop"
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            2,
+            "entries after the panicking one must still be dropped"
+        );
     }
 }
